@@ -41,7 +41,7 @@ def index():
     """
 
 
-@socketio.on('publish', namespace='/camera')
+@socketio.on('publish', namespace='/camera_publish')
 def publish(message):
     emit('subscribe', message, broadcast=True, namespace='/camera')
 
