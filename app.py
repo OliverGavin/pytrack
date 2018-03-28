@@ -3,12 +3,14 @@ import base64
 import logging
 from functools import partial
 
-import numpy as np
+import pyautogui
 import cv2
+import numpy as np
 from socketIO_client import SocketIO, BaseNamespace
 
 from pytrackcontrol import TrackEventController
 from pytrackcontrol.providers import FPSProvider, FaceBBoxProvider
+from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convexity_defects, find_deep_convexity_defects_points, find_max_incircle
 
 
 parser = argparse.ArgumentParser()
@@ -42,11 +44,18 @@ class Camera(BaseNamespace):
 
 socket = SocketIO('127.0.0.1', 5000)
 camera_namespace = socket.define(Camera, '/camera_publish')
+
 track = TrackEventController()
 
 
+@track.register('img', dep=['src'])
+def img_provider(resolve, src):
+    resolve(src[:180])
+    # resolve(src)
+
+
 face_bbox_provider = FaceBBoxProvider()
-track.register('face_bbox', face_bbox_provider.provide)
+track.register('face_bbox', face_bbox_provider.provide, dep=['img'])
 
 # separate viola jones from tracker??
 
@@ -210,6 +219,50 @@ def skin_segmentation_mask_provider(resolve, ycrcb_mask, hsv_mask, bbox):
 
     resolve(skin_mask)
 
+# def a(ximg_ycrcb, xycrcb_range):
+#     import cv2
+#     img_y, img_cr, img_cb = cv2.split(ximg_ycrcb)
+#
+#     mask_y = cv2.inRange(img_y, xycrcb_range['y'].min, xycrcb_range['y'].max)
+#     mask_cr = cv2.inRange(img_cr, xycrcb_range['cr'].min, xycrcb_range['cr'].max)
+#     mask_cb = cv2.inRange(img_cb, xycrcb_range['cb'].min, xycrcb_range['cb'].max)
+#
+#     ycrcb_mask = cv2.bitwise_and(mask_cb, mask_cr)
+#     ycrcb_mask = cv2.bitwise_and(mask_y, ycrcb_mask)
+#     return ycrcb_mask
+#
+# def b(ximg_hsv, xhsv_range):
+#     import cv2
+#     img_h, img_s, img_v = cv2.split(ximg_hsv)
+#
+#     mask_h = cv2.inRange(img_h, xhsv_range['h'].min, xhsv_range['h'].max)
+#     mask_s = cv2.inRange(img_s, xhsv_range['s'].min, xhsv_range['s'].max)
+#     mask_v = cv2.inRange(img_v, xhsv_range['v'].min, xhsv_range['v'].max)
+#
+#     hsv_mask = cv2.bitwise_and(mask_v, mask_s)
+#     hsv_mask = cv2.bitwise_and(mask_h, hsv_mask)
+#
+# @track.register('skin_segmentation_mask', dep=['img_ycrcb', 'ycrcb_range', 'img_hsv', 'hsv_range', 'face_bbox'])
+# def skin_segmentation_mask_provider(resolve, img_ycrcb, ycrcb_range, img_hsv, hsv_range, bbox):
+#
+#
+#     # futures = [self._executor.submit(execute, fn, e, inputs) for e, (fn, res, inputs) in jobs.items()]
+#     #                     for future in futures:
+#     #                         res(future.result())
+#     fa = executor.submit(a, img_ycrcb, ycrcb_range)
+#     fb = executor.submit(b, img_hsv, hsv_range)
+#
+#     ycrcb_mask = fa.result()
+#     hsv_mask = fb.result()
+#     print(ycrcb_mask)
+#     skin_mask = cv2.bitwise_or(ycrcb_mask, hsv_mask)
+#
+#     x, y, w, h = bbox
+#     iw, ih = ycrcb_mask.shape
+#     skin_mask[y - int(.2 * h): y + h + int(.4 * h), x: x + w] = 0
+#
+#     resolve(skin_mask)
+
 
 @track.register('skin_mask', dep=['skin_segmentation_mask'])
 def skin_mask_provider(resolve, skin_segmentation_mask):
@@ -224,9 +277,7 @@ def skin_mask_provider(resolve, skin_segmentation_mask):
 
 @track.register('contours', dep=['skin_mask'])
 def contours_provider(resolve, skin_mask):
-    height, width = skin_mask.shape
-    _, contours, hier = cv2.findContours(skin_mask, cv2.RETR_LIST, cv2.CHAIN_APPROX_SIMPLE)
-    contours = list(filter(lambda cnt: 800 < cv2.contourArea(cnt) < 8000, contours))
+    contours = find_contours(skin_mask, min_area=800, max_area=8000)
     resolve(contours)
 
 
@@ -234,9 +285,7 @@ def contours_provider(resolve, skin_mask):
 def contours_min_enclosing_circle_provider(resolve, contours):
     circles = []
     for cnt in contours:
-        (x, y), radius = cv2.minEnclosingCircle(cnt)
-        center = (int(x), int(y))
-        radius = int(radius)
+        center, radius = find_min_enclosing_circle(cnt)
         circles.append((center, radius))
 
     resolve(circles)
@@ -246,9 +295,7 @@ def contours_min_enclosing_circle_provider(resolve, contours):
 def contours_moments_centroid_provider(resolve, contours):
     centroids = []
     for cnt in contours:
-        M = cv2.moments(cnt)  # https://en.wikipedia.org/wiki/Image_moment
-        cX = int(M["m10"] / M["m00"])
-        cY = int(M["m01"] / M["m00"])
+        cX, cY = find_centroid(cnt)
         centroids.append((cX, cY))
 
     resolve(centroids)
@@ -258,8 +305,7 @@ def contours_moments_centroid_provider(resolve, contours):
 def contours_convexity_defects_provider(resolve, contours):
     convexity_defects = []
     for cnt in contours:
-        hull = cv2.convexHull(cnt, returnPoints=False)
-        defects = cv2.convexityDefects(cnt, hull)
+        defects = find_convexity_defects(cnt)
         convexity_defects.append(defects)
 
     resolve(convexity_defects)
@@ -267,12 +313,11 @@ def contours_convexity_defects_provider(resolve, contours):
 
 @track.register('contours_deep_convexity_defects_points', dep=['contours', 'contours_convexity_defects'])
 def contours_deep_convexity_defects_points_provider(resolve, contours, convexity_defects):
+    # import pdb; pdb.set_trace()
     deep_convexity_defects_points = []
     for cnt, defects in zip(contours, convexity_defects):
-        deep_idx = defects[defects[:, 0, 3] > 200][:, 0, 2]     # d > 200  (depth index=3)
-                                                                # flatten with :, 0
-                                                                # get the index of the farthest defect (farthest index=2)
-        deep_convexity_defects_points.append(cnt[deep_idx][:, 0])   # select contours with idx and flatten
+        points = find_deep_convexity_defects_points(cnt, defects)
+        deep_convexity_defects_points.append(points)
     resolve(deep_convexity_defects_points)
 
 
@@ -287,34 +332,30 @@ def nearest_point_distance(node, nodes):
 @track.register('contours_max_incircle', dep=['contours', 'contours_moments_centroid', 'contours_deep_convexity_defects_points'])
 def contours_max_incircle_provider(resolve, contours, centroids, deep_convexity_defects_points):
     incircles = []
-    for cnt, (cX, cY), defects_points in zip(contours, centroids, deep_convexity_defects_points):
-        points = cnt[::5][:, 0]
-        points = np.concatenate((points, defects_points), axis=0)
-
-        if len(points) >= 4:
-
-            from scipy.spatial import Voronoi
-            vor = Voronoi(points)
-
-            max_d = 0
-            max_v = None
-            for (vX, vY) in vor.vertices:
-                # cv2.circle(img, (int(vX), int(vY)), 1, [200, 200, 0], 1)
-                # _, d, _ = nearest_point_distance((vX, vY), points)
-                d = nearest_point_distance((vX, vY), points)
-                # also check if starting point is in the circle
-                if d > max_d and np.linalg.norm(np.array([vX, vY]) - np.array([cX, cY])) < d:
-                    max_d = d
-                    max_v = (vX, vY)
-
-            if max_v:
-                center, radius = (int(max_v[0]), int(max_v[1])), int(max_d)
-                incircles.append((center, radius))
-                # cv2.circle(img, center, radius, [0, 0, 0], 1)
-            else:
-                incircles.append(None)
+    for cnt, centroid, defects_points in zip(contours, centroids, deep_convexity_defects_points):
+        incircle = find_max_incircle(cnt, centroid, defects_points)
+        incircles.append(incircle)
 
     resolve(incircles)
+
+
+@track.register('hands', dep=['contours_moments_centroid'])
+def hands_provider(resolve, centroids):
+    resolve(centroids)
+
+
+@track.on('hands')
+def hands_handler(hands):
+    width, height = pyautogui.size()
+    for (x, y) in hands:
+        x = 320 - x
+        # x = int((x / 320) * width)
+        # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
+        x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
+        # y = int((y / 240) * height)
+        # y = int((y / 180) * height)
+        y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
+        pyautogui.moveTo(x, y, duration=0.0)
 
 
 @track.on('face')
@@ -420,8 +461,10 @@ if SHOW_TRACKERS or DEBUG:
         # img = cv2.flip(img, flipCode=1)
         cv2.putText(img=img, text='{:.2f}'.format(debug['fps']),
                     org=(0, 20), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
-                    fontScale=1, color=150)
+                    fontScale=1, color=255)
 
+        # cv2.rectangle(img, (0, 0), (320, 180), (0, 0, 255), 3)
+        # cv2.imshow('img', img[:, :, :180])
         cv2.imshow('img', img)
         cv2.waitKey(10)
 
