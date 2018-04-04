@@ -10,7 +10,48 @@ from socketIO_client import SocketIO, BaseNamespace
 
 from pytrackcontrol import TrackEventController
 from pytrackcontrol.providers import FPSProvider, FaceBBoxProvider
-from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convexity_defects, find_deep_convexity_defects_points, find_max_incircle
+from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convex_hull, find_convexity_defects, find_k_curvatures, find_deep_convexity_defects_points, find_max_incircle
+
+from multiprocessing import Process, Pipe
+
+
+def reader(pipe):
+    in_pipe, out_pipe = pipe
+    out_pipe.close()    # We are only reading
+
+    width, height = pyautogui.size()
+    xx, yy = 0, 0
+
+    while True:
+        try:
+            x, y = in_pipe.recv()
+            y = min(y, 180)
+
+            x = 320 - x
+            # x = int((x / 320) * width)
+            # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
+            x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
+            # y = int((y / 240) * height)
+            # y = int((y / 180) * height)
+            y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
+
+            if abs(xx - x) > 10 or abs(yy - y) > 10:  # TODO
+                #pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
+                xx, yy = x, y
+
+        except EOFError:
+            break
+
+
+def writer(coor, out_pipe):
+    out_pipe.send(coor)
+
+
+out_pipe, in_pipe = Pipe()
+process = Process(target=reader, args=((out_pipe, in_pipe),))
+process.start()     # Launch the reader process
+
+out_pipe.close()       # We are only writing
 
 
 parser = argparse.ArgumentParser()
@@ -50,8 +91,8 @@ track = TrackEventController()
 
 @track.register('img', dep=['src'])
 def img_provider(resolve, src):
-    resolve(src[:180])
-    # resolve(src)
+    # resolve(src[:180])
+    resolve(src)
 
 
 face_bbox_provider = FaceBBoxProvider()
@@ -138,17 +179,45 @@ def create_color_range_slider(title, color_space_range):
         cv2.createTrackbar(f'{label} max', title, color_range.max, 255, _update(color_range, 'max'))
 
 
+# # Lab black screen
+# yCrCb_range = ColorSpaceRange({
+#     'y':  (131, 255),
+#     'cr': (129, 176),
+#     'cb': (0,   255),
+# })
+#
+# HSV_range = ColorSpaceRange({
+#     'h': (106, 255),
+#     's': (12,  70),
+#     'v': (150, 247),
+# })
+
+# Lab wall
 yCrCb_range = ColorSpaceRange({
-    'y':  (144, 255),
-    'cr': (0,   255),
-    'cb': (0,   255),
+    'y':  (118, 255),
+    'cr': (133, 159),
+    'cb': (104, 136),
 })
 
 HSV_range = ColorSpaceRange({
-    'h': (0,   255),
-    's': (0,   39),
-    'v': (146, 247),
+    'h': (0,   22),
+    's': (34,  105),
+    'v': (141, 215),
 })
+
+# # Home
+# yCrCb_range = ColorSpaceRange({
+#     'y':  (144, 255),
+#     'cr': (0,   255),
+#     'cb': (0,   255),
+# })
+#
+# HSV_range = ColorSpaceRange({
+#     'h': (0,   255),
+#     's': (0,   39),
+#     'v': (146, 247),
+# })
+#
 
 
 @track.register('img_ycrcb', dep=['img'])
@@ -165,6 +234,60 @@ def hsv_color_conversion_provider(resolve, img):
     # img_hsv = cv2.GaussianBlur(img_hsv, (3, 3), 0)
     # img_hsv = cv2.medianBlur(img_hsv, ksize=5)
     resolve(img_hsv)
+
+
+# def get_bounds(roi):
+#     roi = roi.copy()
+#     size = len(roi)
+#     pts = [
+#                     (1/3, 1/6), (1/2, 1/6), (2/3, 1/6),
+#         (3/12, 3/6), (1/3, 3/6), (1/2, 3/6), (2/3, 3/6), (9/12, 3/6),
+#                     (1/3, 4/6), (1/2, 4/6), (2/3, 4/6),
+#     ]
+#     w = 5
+#     h = 5
+#     pt_samples = []
+#     for x, y in pts:
+#         x = int(size * x)
+#         y = int(size * y)
+#         pt_roi = roi[y: y + h, x: x + w]
+#         average_color = [np.median(pt_roi[:, :, i]) for i in range(pt_roi.shape[-1])]
+#         pt_samples.append(average_color)
+#         cv2.rectangle(roi, (x, y), (x + w, y + h), (255, 0, 0), 1)
+#
+#     lower = np.min(pt_samples, axis=0)
+#     upper = np.max(pt_samples, axis=0)
+#     # lower = np.min(pt_samples, axis=0)*.75 + np.median(pt_samples, axis=0)*.25
+#     # upper = np.max(pt_samples, axis=0)*.75 + np.median(pt_samples, axis=0)*.25
+#
+#     cv2.imshow('pic', roi)
+#     return lower, upper
+#
+#
+# @track.register('ycrcb_range', dep=['img_ycrcb', 'face_bbox'])
+# def ycrcb_color_range_provider(resolve, img, bbox):
+#     x, y, w, h = bbox
+#     roi = img[y: y + h, x: x + w]
+#     color_range_arr = get_bounds(roi)
+#     color_range = ColorSpaceRange({
+#         'y':  (color_range_arr[0][0], color_range_arr[1][0]),
+#         'cr': (color_range_arr[0][1], color_range_arr[1][1]),
+#         'cb': (color_range_arr[0][2], color_range_arr[1][2]),
+#     })
+#     resolve(color_range)
+#
+#
+# @track.register('hsv_range', dep=['img_hsv', 'face_bbox'])
+# def hsv_color_range_provider(resolve, img, bbox):
+#     x, y, w, h = bbox
+#     roi = img[y: y + h, x: x + w]
+#     color_range_arr = get_bounds(roi)
+#     color_range = ColorSpaceRange({
+#         'h': (color_range_arr[0][0], color_range_arr[1][0]),
+#         's': (color_range_arr[0][1], color_range_arr[1][1]),
+#         'v': (color_range_arr[0][2], color_range_arr[1][2]),
+#     })
+#     resolve(color_range)
 
 
 @track.register('ycrcb_range', dep=['img'])
@@ -270,7 +393,7 @@ def skin_mask_provider(resolve, skin_segmentation_mask):
     skin_mask = cv2.morphologyEx(skin_segmentation_mask, cv2.MORPH_ERODE, kernel)
     cv2.morphologyEx(skin_mask, cv2.MORPH_DILATE, kernel, dst=skin_mask)
 
-    cv2.medianBlur(skin_mask, ksize=9, dst=skin_mask)
+    cv2.medianBlur(skin_mask, ksize=7, dst=skin_mask)
 
     resolve(skin_mask)
 
@@ -301,10 +424,30 @@ def contours_moments_centroid_provider(resolve, contours):
     resolve(centroids)
 
 
-@track.register('contours_convexity_defects', dep=['contours'])
-def contours_convexity_defects_provider(resolve, contours):
-    convexity_defects = []
+@track.register('contours_convex_hulls', dep=['contours'])
+def contours_convex_hulls_provider(resolve, contours):
+    convex_hulls = []
     for cnt in contours:
+        hull = find_convex_hull(cnt)
+        convex_hulls.append(hull)
+
+    resolve(convex_hulls)
+
+
+@track.register('k_curvatures', dep=['contours', 'contours_convex_hulls'])
+def k_curvatures_provider(resolve, contours, convex_hulls):
+    k_curvatures = []
+    for cnt, hull in zip(contours, convex_hulls):
+        curvatures = find_k_curvatures(cnt, hull, k=7, theta=60)
+        k_curvatures.append(curvatures)
+
+    resolve(k_curvatures)
+
+
+@track.register('contours_convexity_defects', dep=['contours', 'contours_convex_hulls'])
+def contours_convexity_defects_provider(resolve, contours, convex_hulls):
+    convexity_defects = []
+    for cnt, hull in zip(contours, convex_hulls):
         defects = find_convexity_defects(cnt)
         convexity_defects.append(defects)
 
@@ -333,7 +476,9 @@ def nearest_point_distance(node, nodes):
 def contours_max_incircle_provider(resolve, contours, centroids, deep_convexity_defects_points):
     incircles = []
     for cnt, centroid, defects_points in zip(contours, centroids, deep_convexity_defects_points):
-        incircle = find_max_incircle(cnt, centroid, defects_points)
+        points = cnt[::5][:, 0]  # Sample the contour
+        points = np.concatenate((points, defects_points), axis=0) if defects_points.size else points
+        incircle = find_max_incircle(centroid, points)
         incircles.append(incircle)
 
     resolve(incircles)
@@ -346,16 +491,17 @@ def hands_provider(resolve, centroids):
 
 @track.on('hands')
 def hands_handler(hands):
-    width, height = pyautogui.size()
+    # width, height = pyautogui.size()
     for (x, y) in hands:
-        x = 320 - x
-        # x = int((x / 320) * width)
-        # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
-        x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
-        # y = int((y / 240) * height)
-        # y = int((y / 180) * height)
-        y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
-        pyautogui.moveTo(x, y, duration=0.0)
+        # x = 320 - x
+        # # x = int((x / 320) * width)
+        # # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
+        # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
+        # # y = int((y / 240) * height)
+        # # y = int((y / 180) * height)
+        # y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
+        # pyautogui.moveTo(x, y, duration=0.0)
+        writer((x, y), in_pipe)
 
 
 @track.on('face')
@@ -366,16 +512,7 @@ def face_handler(face):
         print(face)
     encoded_img = base64.b64encode(buffer).decode('UTF-8')
     camera_namespace.emit('publish', {'count': encoded_img}, namespace='/camera_publish')
-    # socket.wait(0.001)
-    # ...
-
-
-# @track.on('ycrcb_color_range')
-# def test_handler(ycrcb_color_range):
-#     print(ycrcb_color_range['y'].min, ycrcb_color_range['y'].max)
-#     print(ycrcb_color_range['Cr'].min, ycrcb_color_range['Cr'].max)
-#     print(ycrcb_color_range['Cb'].min, ycrcb_color_range['Cb'].max)
-#     print()
+    socket.wait(0.001)
 
 
 if DEBUG:
@@ -402,8 +539,8 @@ if SHOW_TRACKERS or DEBUG:
     fps_provider = FPSProvider()
     track.register('fps', fps_provider.provide)
 
-    @track.register('debug', dep=['img', 'fps', 'face_bbox', 'contours', 'contours_min_enclosing_circle', 'contours_moments_centroid', 'contours_convexity_defects', 'contours_deep_convexity_defects_points', 'contours_max_incircle'])
-    def debug_provider(resolve, img, fps, face_bbox, contours, min_enclosing_circles, centroids, convexity_defects, deep_convexity_defects_points, max_incircles):
+    @track.register('debug', dep=['img', 'fps', 'face_bbox', 'contours', 'contours_min_enclosing_circle', 'contours_moments_centroid', 'contours_convex_hulls', 'k_curvatures', 'contours_convexity_defects', 'contours_deep_convexity_defects_points', 'contours_max_incircle'])
+    def debug_provider(resolve, img, fps, face_bbox, contours, min_enclosing_circles, centroids, convex_hulls, k_curvatures, convexity_defects, deep_convexity_defects_points, max_incircles):
         resolve({
             'img': img,
             'fps': fps,
@@ -411,6 +548,8 @@ if SHOW_TRACKERS or DEBUG:
             'contours': contours,
             'min_enclosing_circles': min_enclosing_circles,
             'centroids': centroids,
+            'convex_hulls': convex_hulls,
+            'k_curvatures': k_curvatures,
             'convexity_defects': convexity_defects,
             'deep_convexity_defects_points': deep_convexity_defects_points,
             'max_incircles': max_incircles
@@ -422,20 +561,30 @@ if SHOW_TRACKERS or DEBUG:
         contours = debug['contours']
         min_enclosing_circles = debug['min_enclosing_circles']
         centroids = debug['centroids']
+        convex_hulls = debug['convex_hulls']
+        k_curvatures = debug['k_curvatures']
         convexity_defects = debug['convexity_defects']
         deep_convexity_defects_points = debug['deep_convexity_defects_points']
         max_incircles = debug['max_incircles']
 
         # flooded_contours = np.zeros((height, width), np.uint8)
 
-        for cnt, enclosing_circle, (cX, cY), defects, defects_deep, incircle in zip(contours, min_enclosing_circles, centroids, convexity_defects, deep_convexity_defects_points, max_incircles):
+        for cnt, enclosing_circle, (cX, cY), hull, k_curvature, defects, defects_deep, incircle in zip(contours, min_enclosing_circles, centroids, convex_hulls, k_curvatures, convexity_defects, deep_convexity_defects_points, max_incircles):
             cv2.drawContours(img, [cnt], 0, (0, 255, 0), cv2.FILLED)
             # cv2.drawContours(flooded_contours, [cnt], 0, 255, cv2.FILLED)
 
             (center, radius) = enclosing_circle
-            cv2.circle(img, center, radius, (255, 0, 0), 2)
+            cv2.circle(img, center, radius, (0, 0, 0), 1)
 
             cv2.circle(img, (cX, cY), 7, (255, 255, 255), -1)
+
+            for i in k_curvature:
+                point = cnt[i][0][0]
+                cv2.circle(img, (point[0], point[1]), 4, [255, 0, 0], 2)
+                point = cnt[(i + 7) % cnt.shape[0]][0][0]
+                cv2.circle(img, (point[0], point[1]), 1, [255, 255, 255], -1)
+                point = cnt[i - 7][0][0]
+                cv2.circle(img, (point[0], point[1]), 1, [255, 255, 255], -1)
 
             for i in range(defects.shape[0]):
                 s, e, f, d = defects[i, 0]
@@ -471,72 +620,6 @@ if SHOW_TRACKERS or DEBUG:
 
 track.start()
 
-#
-
-
-# @track.register('img_gray')
-# def img_gray_provider(resolve, img):
-#     pass  # machine vision
-#
-#
-# @track.register('face_bbox', dep='img_gray')
-# def face_bbox_finder(resolve, img_gray):
-#     pass  # machine vision
-#
-#
-# @track.register('eyes_bbox', dep=['img_gray', 'face_bbox'])
-# def eyes_bbox_finder(resolve, img_gray, face_bbox):
-#     pass  # machine vision
-#
-#
-# @track.register('faces', dep=['img', 'face_bbox'])
-# def faces_finder(resolve, img, face_bbox):
-#     pass  # machine vision
-#
-#
-# @track.on('img')
-# def img_handler(img):
-#     retval, buffer = cv2.imencode('.jpg', img)
-#     encoded_img = str(base64.b64encode(buffer))[2:-1]
-#     camera_namespace.emit('publish', {'count': encoded_img}, namespace='/camera_publish')
-
-
-# @track.on('mousemove')
-# def mouse_handler(someobj):
-#     pass  # invoke some mouse control
-#
-#
-# @track.on('gesture')
-# def gesture_handler(someobj):
-#     pass  # invoke some gesture control
-#
-#
-# @track.on('face')
-# def face_handler(someobj):
-#     pass  # invoke some face control
-#
-#
-# @track.on('qr')   # dep=b&w ??? (in mv code)
-# def qr_handler(someobj):
-#     pass  # invoke some qr control
-#
-#
-# @track.on('img')   # ???
-# def img_handler(someobj):
-#     pass  # invoke some img control
-#
-#
-# @track.register('cats')
-# def cat_finder(resolve, img):   # need state? obj? (might need context manager support if holding resources...)
-#     pass  # machine vision
-#
-#
-# @track.register('grumpycats', dep='cats')
-# def grumpy_cat_finder(resolve, cat_img):
-#     pass  # machine vision
-
-
-# fps decorator?
 
 # ??? pause the event!!! ..but check for consumers...
 # track.pause('cats')   # what about dependencies? =False (default, stop callbacks, but continue eval if other deps)
@@ -544,11 +627,3 @@ track.start()
 #
 
 # add ttl? i.e. get single picture? call pause on the decorator that was saved to dict
-
-
-#  # server
-# socketio = SocketIO(app, message_queue='redis://')
-#
-#  # CV thread/process?
-# socketio = SocketIO(message_queue='redis://')
-# socketio.emit('my event', {'data': 'foo'}, namespace='/test')
