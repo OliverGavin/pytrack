@@ -3,6 +3,7 @@ import base64
 import logging
 from enum import Enum
 from functools import partial
+from multiprocessing import Process, Pipe
 
 import pyautogui
 import cv2
@@ -11,77 +12,14 @@ from socketIO_client import SocketIO, BaseNamespace
 
 from pytrackcontrol import TrackEventController
 from pytrackcontrol.providers import FPSProvider, FaceBBoxProvider
+from pytrackvision.utils.color import ColorSpaceRange, extract_face_color, create_color_range_slider
 from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convex_hull, find_convexity_defects, find_k_curvatures, find_deep_convexity_defects_points, find_max_incircle, nearest_point_distance
-
-from multiprocessing import Process, Pipe
-
-
-class MouseClikedState(Enum):
-    CURRENT = 0
-    RELEASED = 1
-    PRESSED = 2
-
-
-def reader(pipe):
-    in_pipe, out_pipe = pipe
-    out_pipe.close()    # We are only reading
-
-    width, height = pyautogui.size()
-    xx, yy = 0, 0
-
-    while True:
-        try:
-            (x, y), click = in_pipe.recv()
-            y = min(y, 180)
-
-            x = 320 - x
-            x = int((x / 320) * width)
-            # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
-            # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
-            # y = int((y / 240) * height)
-            # y = int((y / 180) * height)
-            y = int(((y / 180) * height) - 0.1 * (((180 - y) / 180) * height))
-
-            # if abs(xx - x) > 10 or abs(yy - y) > 10:  # TODO
-            #     xx, yy = x, y
-
-            # if click:
-            #     print('drag')
-            #     pyautogui.dragTo(x, y, duration=0.03, pause=0.0, button='left')
-            #     # pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
-            # else:
-            #     print('move')
-            #     pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
-
-            if click == MouseClikedState.RELEASED:
-                print('RELEASED')
-                pyautogui.mouseUp(button='left')
-            elif click == MouseClikedState.PRESSED:
-                print('PRESSED')
-                pyautogui.mouseDown(button='left')
-            elif click == MouseClikedState.CURRENT:
-                print('CURRENT')
-
-            if abs(xx - x) > 10 or abs(yy - y) > 10:  # TODO
-                pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
-                xx, yy = x, y
-
-        except EOFError:
-            break
-
-
-def writer(coor, out_pipe):
-    out_pipe.send(coor)
-
-
-out_pipe, in_pipe = Pipe()
-process = Process(target=reader, args=((out_pipe, in_pipe),))
-process.start()     # Launch the reader process
-
-out_pipe.close()       # We are only writing
+from pytrackvision.gesture import Gesture, GestureStateMachine
 
 
 parser = argparse.ArgumentParser()
+parser.add_argument('--use-color', choices=['face', 'lab', 'home'], default='home', type=str)
+parser.add_argument('--use-src', default=None, type=str)
 parser.add_argument(
     '--show-trackers',
     help="Show tracking information",
@@ -100,28 +38,82 @@ parser.add_argument(
     action="store_const", dest="loglevel", const=logging.INFO,
 )
 args = parser.parse_args()
+COLOR_MODE = args.use_color
+SRC = args.use_src
 SHOW_TRACKERS = args.show_trackers
 logging.basicConfig(level=args.loglevel)
-
 DEBUG = bool(args.loglevel != logging.WARNING)
+
+
+class MouseClikedState(Enum):
+    CURRENT = 0
+    RELEASED = 1
+    PRESSED = 2
+
+
+def handle_mouse_event(pipe):
+    # A separate process is required for mouse movements with animations/transitions
+    # as the library is not asynchronous
+    in_pipe, out_pipe = pipe
+    out_pipe.close()    # We are only reading
+
+    width, height = pyautogui.size()
+    xx, yy = 0, 0
+
+    while True:
+        try:
+            (x, y), click = in_pipe.recv()
+            y = min(y, 180)
+
+            x = 320 - x  # Flip
+            x = int((x / 320) * width)
+            y = int(((y / 180) * height) - 0.1 * (((180 - y) / 180) * height))  # Compensate for camera position
+
+            if click == MouseClikedState.RELEASED:
+                print('RELEASED')
+                pyautogui.mouseUp(button='left')
+            elif click == MouseClikedState.PRESSED:
+                print('PRESSED')
+                pyautogui.mouseDown(button='left')
+            elif click == MouseClikedState.CURRENT:
+                print('CURRENT')
+
+            if abs(xx - x) > 10 or abs(yy - y) > 10:  # prevent small movements
+                pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
+                xx, yy = x, y
+
+        except EOFError:
+            break
+
+
+def send_mouse_event(coor, out_pipe):
+    out_pipe.send(coor)
+
+
+out_pipe, in_pipe = Pipe()
+process = Process(target=handle_mouse_event, args=((out_pipe, in_pipe),))
+process.start()   # Launch the handle_mouse_event process
+out_pipe.close()  # We are only writing
 
 
 class Camera(BaseNamespace):
     pass
 
 
+# Set up the websocket
 socket = SocketIO('127.0.0.1', 5000)
 camera_namespace = socket.define(Camera, '/camera_publish')
 
-track = TrackEventController()
+# Initialise the workflow object
+track = TrackEventController(src=SRC)
 
 
 @track.register('img', dep=['src'])
 def img_provider(resolve, src):
-    # resolve(src[:180])
     resolve(src)
 
 
+# Decorate a class method (storing state)
 face_bbox_provider = FaceBBoxProvider()
 track.register('face_bbox', face_bbox_provider.provide, dep=['img'])
 
@@ -130,207 +122,92 @@ track.register('face_bbox', face_bbox_provider.provide, dep=['img'])
 def face_provider(resolve, img, face_bbox):
     if face_bbox:
         height, width, _ = img.shape
+        # Restrict out of bounds pixels
         clamp = lambda minimum, maximum, value: max(minimum, min(maximum, value))
         clamp_x = partial(clamp, 0, width)
         clamp_y = partial(clamp, 0, height)
         x, y, w, h = face_bbox
-        s = int(w * 0.2)
+        s = int(w * 0.2)  # Add some padding to capture entire face
         w = h = w + 2 * s
         x, y = x-s, y-s
-        face = img[clamp_y(y) : clamp_y(y+h), clamp_x(x) : clamp_x(x+w)]
+        face = img[clamp_y(y): clamp_y(y+h), clamp_x(x): clamp_x(x+w)]
         resolve(face)
-
-
-class Range:
-
-    def __init__(self, range):
-        """Store a pair of values defining a range with a min and max.
-        """
-        self.min = range[0]
-        self.max = range[1]
-
-
-class ColorSpaceRange:
-
-    def __init__(self, colors):
-        """Store a range for values in a color space.
-
-        Parameters
-        ----------
-        colors: Dict[str: Tuple[int]]
-            A map of color space labels and a range of values.
-        """
-        self._colors = {k: Range(v) for k, v in colors.items()}
-
-    def __getitem__(self, key):
-        return self._colors[key]
-
-    @property
-    def colors(self):
-        """
-        Returns
-        -------
-        Dict[str: Range]
-        """
-        return self._colors
-
-
-def create_color_range_slider(title, color_space_range):
-    """Create a slider to adjust the color space range.
-
-    Parameters
-    ----------
-    title: str
-    color_space_range: ColorSpaceRange
-    """
-
-    def _update(color_range, attr):
-        def _set(v):
-            if attr == 'min':
-                color_range.min = v
-            elif attr == 'max':
-                color_range.max = v
-
-        return _set
-
-    cv2.namedWindow(title)
-    for label, color_range in color_space_range.colors.items():
-        cv2.createTrackbar(f'{label} min', title, color_range.min, 255, _update(color_range, 'min'))
-        cv2.createTrackbar(f'{label} max', title, color_range.max, 255, _update(color_range, 'max'))
-
-
-# Lab black screen
-yCrCb_range = ColorSpaceRange({
-    'y':  (131, 255),
-    'cr': (129, 176),
-    'cb': (0,   255),
-})
-
-HSV_range = ColorSpaceRange({
-    'h': (106, 255),
-    's': (12,  70),
-    'v': (150, 247),
-})
-
-# # Lab wall new
-# yCrCb_range = ColorSpaceRange({
-#     'y':  (133, 195),
-#     'cr': (136, 162),
-#     'cb': (122, 137),
-# })
-#
-# HSV_range = ColorSpaceRange({
-#     'h': (0,   192),
-#     's': (28,  160),
-#     'v': (150, 223),
-# })
-
-# # Lab wall
-# yCrCb_range = ColorSpaceRange({
-#     'y':  (118, 255),
-#     'cr': (133, 159),
-#     'cb': (104, 136),
-# })
-#
-# HSV_range = ColorSpaceRange({
-#     'h': (0,   22),
-#     's': (34,  105),
-#     'v': (141, 215),
-# })
-
-# # Home
-# yCrCb_range = ColorSpaceRange({
-#     'y':  (144, 255),
-#     'cr': (0,   255),
-#     'cb': (0,   255),
-# })
-#
-# HSV_range = ColorSpaceRange({
-#     'h': (0,   255),
-#     's': (0,   39),
-#     'v': (146, 247),
-# })
-#
 
 
 @track.register('img_ycrcb', dep=['img'])
 def ycrcb_color_conversion_provider(resolve, img):
     img_ycrcb = cv2.cvtColor(img, cv2.COLOR_BGR2YCrCb)
-    # img_ycrcb = cv2.GaussianBlur(img_ycrcb, (3, 3), 0)
-    # img_ycrcb = cv2.medianBlur(img_ycrcb, ksize=5)
     resolve(img_ycrcb)
 
 
 @track.register('img_hsv', dep=['img'])
 def hsv_color_conversion_provider(resolve, img):
     img_hsv = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
-    # img_hsv = cv2.GaussianBlur(img_hsv, (3, 3), 0)
-    # img_hsv = cv2.medianBlur(img_hsv, ksize=5)
     resolve(img_hsv)
 
 
-# def get_bounds(roi):
-#     roi = roi.copy()
-#     size = len(roi)
-#     pts = [
-#                     (1/3, 1/6), (1/2, 1/6), (2/3, 1/6),
-#         (3/12, 3/6), (1/3, 3/6), (1/2, 3/6), (2/3, 3/6), (9/12, 3/6),
-#                     (1/3, 4/6), (1/2, 4/6), (2/3, 4/6),
-#     ]
-#     w = 5
-#     h = 5
-#     pt_samples = []
-#     for x, y in pts:
-#         x = int(size * x)
-#         y = int(size * y)
-#         pt_roi = roi[y: y + h, x: x + w]
-#         average_color = [np.median(pt_roi[:, :, i]) for i in range(pt_roi.shape[-1])]
-#         pt_samples.append(average_color)
-#         cv2.rectangle(roi, (x, y), (x + w, y + h), (255, 0, 0), 1)
-#
-#     lower = np.min(pt_samples, axis=0)
-#     upper = np.max(pt_samples, axis=0)
-#     # lower = np.min(pt_samples, axis=0)*.75 + np.median(pt_samples, axis=0)*.25
-#     # upper = np.max(pt_samples, axis=0)*.75 + np.median(pt_samples, axis=0)*.25
-#
-#     cv2.imshow('pic', roi)
-#     return lower, upper
-#
-#
-# @track.register('ycrcb_range', dep=['img_ycrcb', 'face_bbox'])
-# def ycrcb_color_range_provider(resolve, img, bbox):
-#     x, y, w, h = bbox
-#     roi = img[y: y + h, x: x + w]
-#     color_range_arr = get_bounds(roi)
-#     color_range = ColorSpaceRange({
-#         'y':  (color_range_arr[0][0], color_range_arr[1][0]),
-#         'cr': (color_range_arr[0][1], color_range_arr[1][1]),
-#         'cb': (color_range_arr[0][2], color_range_arr[1][2]),
-#     })
-#     resolve(color_range)
-#
-#
-# @track.register('hsv_range', dep=['img_hsv', 'face_bbox'])
-# def hsv_color_range_provider(resolve, img, bbox):
-#     x, y, w, h = bbox
-#     roi = img[y: y + h, x: x + w]
-#     color_range_arr = get_bounds(roi)
-#     color_range = ColorSpaceRange({
-#         'h': (color_range_arr[0][0], color_range_arr[1][0]),
-#         's': (color_range_arr[0][1], color_range_arr[1][1]),
-#         'v': (color_range_arr[0][2], color_range_arr[1][2]),
-#     })
-#     resolve(color_range)
+if COLOR_MODE == 'face':
 
+    @track.register('ycrcb_range', dep=['img_ycrcb', 'face_bbox'])
+    def ycrcb_color_range_provider(resolve, img, bbox):
+        x, y, w, h = bbox
+        roi = img[y: y + h, x: x + w]
+        color_range_arr = extract_face_color(roi)
+        color_range = ColorSpaceRange({
+            'y':  (color_range_arr[0][0], color_range_arr[1][0]),
+            'cr': (color_range_arr[0][1], color_range_arr[1][1]),
+            'cb': (color_range_arr[0][2], color_range_arr[1][2]),
+        })
+        resolve(color_range)
 
-@track.register('ycrcb_range', dep=['img'])
-def ycrcb_color_range_provider(resolve, img):
-    resolve(yCrCb_range)
+    @track.register('hsv_range', dep=['img_hsv', 'face_bbox'])
+    def hsv_color_range_provider(resolve, img, bbox):
+        x, y, w, h = bbox
+        roi = img[y: y + h, x: x + w]
+        color_range_arr = extract_face_color(roi)
+        color_range = ColorSpaceRange({
+            'h': (color_range_arr[0][0], color_range_arr[1][0]),
+            's': (color_range_arr[0][1], color_range_arr[1][1]),
+            'v': (color_range_arr[0][2], color_range_arr[1][2]),
+        })
+        resolve(color_range)
 
+else:
+    if COLOR_MODE == 'home':
+        # Lab black screen / home
+        yCrCb_range = ColorSpaceRange({
+            'y':  (131, 255),
+            'cr': (129, 176),
+            'cb': (0,   255),
+        })
 
-@track.register('hsv_range', dep=['img'])
-def hsv_color_range_provider(resolve, img):
-    resolve(HSV_range)
+        HSV_range = ColorSpaceRange({
+            'h': (106, 255),
+            's': (12,  70),
+            'v': (150, 247),
+        })
+
+    elif COLOR_MODE == 'lab':
+        # Lab wall
+        yCrCb_range = ColorSpaceRange({
+            'y':  (118, 255),
+            'cr': (133, 159),
+            'cb': (104, 136),
+        })
+
+        HSV_range = ColorSpaceRange({
+            'h': (0,   22),
+            's': (34,  105),
+            'v': (141, 215),
+        })
+
+    @track.register('ycrcb_range', dep=['img'])
+    def ycrcb_color_range_provider(resolve, img):
+        resolve(yCrCb_range)
+
+    @track.register('hsv_range', dep=['img'])
+    def hsv_color_range_provider(resolve, img):
+        resolve(HSV_range)
 
 
 @track.register('ycrcb_mask', dep=['img_ycrcb', 'ycrcb_range'])
@@ -381,7 +258,6 @@ def skin_mask_provider(resolve, skin_segmentation_mask):
     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2, 2))
     skin_mask = cv2.morphologyEx(skin_segmentation_mask, cv2.MORPH_ERODE, kernel)
     cv2.morphologyEx(skin_mask, cv2.MORPH_DILATE, kernel, dst=skin_mask)
-
     cv2.medianBlur(skin_mask, ksize=7, dst=skin_mask)
 
     resolve(skin_mask)
@@ -464,16 +340,6 @@ def contours_max_incircle_provider(resolve, contours, centroids, deep_convexity_
     resolve(incircles)
 
 
-from enum import Enum
-
-
-class Gesture(Enum):
-    NONE = 'NONE'
-    HAND = 'HAND'
-    HAND_OPENED = 'HAND_OPENED'
-    HAND_CLOSED = 'HAND_CLOSED'
-
-
 @track.register('hand_gestures', dep=['contours', 'contours_max_incircle', 'contours_min_enclosing_circle', 'contours_moments_centroid', 'k_curvatures', 'contours_deep_convexity_defects_points'])
 def hand_gestures_provider(resolve, contours, max_incircles, min_enclosing_circles, centroids, k_curvatures, deep_convexity_defects_points):
     gestures = []
@@ -497,134 +363,13 @@ def hand_gestures_provider(resolve, contours, max_incircles, min_enclosing_circl
         else:
             gesture = Gesture.HAND
 
-        # gestures.append(len(k_curvature))
         gestures.append((gesture, centroid))
 
     resolve(gestures)
 
 
-from abc import ABC, abstractmethod
-from collections import deque
-
-
-class GestureState(ABC):
-
-    @abstractmethod
-    def run(self):
-        ...
-
-    @abstractmethod
-    def next(self, gesture):
-        ...
-
-
-class GestureStateTransition(GestureState):
-
-    def __init__(self):
-        self.transitions = None
-
-    def next(self, gesture):
-        if gesture in self.transitions:
-            return self.transitions[gesture]
-        else:
-            raise ValueError(f"Gesture transition ({gesture.name}) not supported from the current state")
-
-
-class HandPending(GestureStateTransition):
-
-    def run(self):
-        # print("Waiting for an opened hand")
-        return Gesture.NONE
-
-    def next(self, gesture):
-        if not self.transitions:
-            self.transitions = {
-                Gesture.NONE: GestureStateMachine.hand_pending,
-                Gesture.HAND_OPENED: GestureStateMachine.hand_opened
-            }
-        return GestureStateTransition.next(self, gesture)
-
-
-class HandOpened(GestureStateTransition):
-
-    def run(self):
-        # print("Opened hand")
-        return Gesture.HAND_OPENED
-
-    def next(self, gesture):
-        if not self.transitions:
-            self.transitions = {
-                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
-                Gesture.NONE: GestureStateMachine.hand_pending,
-                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
-                Gesture.HAND: GestureStateMachine.hand_unkown
-            }
-        return GestureStateTransition.next(self, gesture)
-
-
-class HandClosed(GestureStateTransition):
-
-    def run(self):
-        # print("Closed hand")
-        return Gesture.HAND_CLOSED
-
-    def next(self, gesture):
-        if not self.transitions:
-            self.transitions = {
-                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
-                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
-                Gesture.NONE: GestureStateMachine.hand_pending,
-                Gesture.HAND: GestureStateMachine.hand_unkown
-            }
-        return GestureStateTransition.next(self, gesture)
-
-
-class HandUnkown(GestureStateTransition):
-
-    def run(self):
-        # print("Unknown hand")
-        return Gesture.HAND
-
-    def next(self, gesture):
-        if not self.transitions:
-            self.transitions = {
-                Gesture.HAND: GestureStateMachine.hand_unkown,
-                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
-                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
-                Gesture.NONE: GestureStateMachine.hand_pending
-            }
-        return GestureStateTransition.next(self, gesture)
-
-
-class GestureStateMachine:
-
-    hand_pending = HandPending()
-    hand_opened = HandOpened()
-    hand_closed = HandClosed()
-    hand_unkown = HandUnkown()
-
-    def __init__(self, initialState=None):
-        self.current_state = initialState if initialState else GestureStateMachine.hand_pending
-        self.current_state.run()
-        self.incomming_gestures = deque(maxlen=3)
-
-    def run(self, gesture):
-        # print('input: ', gesture)
-        try:
-            new_state = self.current_state.next(gesture)
-        except ValueError:
-            new_state = self.current_state
-
-        self.incomming_gestures.append(new_state.run())
-        if all([g == gesture for g in self.incomming_gestures]):
-            self.current_state = new_state
-
-        return self.current_state.run()
-
-
 gesture_state_machine = GestureStateMachine()
 pointer_pos = None
-pointer_clicked = False
 
 
 @track.register('hand', dep=['hand_gestures'])
@@ -645,35 +390,17 @@ def hand_provider(resolve, hand_gestures):
 
 @track.on('hand')
 def hand_handler(hand):
-    global pointer_clicked
-    # width, height = pyautogui.size()
     (x, y), gesture = hand
     print(gesture.name, (x, y))
 
     if (gesture == Gesture.HAND_OPENED or gesture == Gesture.NONE):
         click = MouseClikedState.RELEASED  # release
-        # pointer_clicked = False
     elif gesture == Gesture.HAND_CLOSED:
         click = MouseClikedState.PRESSED  # press
-        # pointer_clicked = True
     else:
         click = MouseClikedState.CURRENT  # remain
 
-    pointer_clicked = click
-
-
-    # x = 320 - x
-    # # x = int((x / 320) * width)
-    # # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
-    # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
-    # # y = int((y / 240) * height)
-    # # y = int((y / 180) * height)
-    # y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
-    # pyautogui.moveTo(x, y, duration=0.0)
-    writer(((x, y), pointer_clicked), in_pipe)
-
-
-# merge centroids and gestures for state machine
+    send_mouse_event(((x, y), click), in_pipe)
 
 
 @track.on('face')
@@ -682,11 +409,14 @@ def face_handler(face):
         retval, buffer = cv2.imencode('.jpg', face)
     except Exception:
         print(face)
+        return
     encoded_img = base64.b64encode(buffer).decode('UTF-8')
-    camera_namespace.emit('publish', {'count': encoded_img}, namespace='/camera_publish')
+    # Publish the image via websockets
+    camera_namespace.emit('publish', {'img': encoded_img}, namespace='/camera_publish')
     socket.wait(0.001)
 
 
+# Visualisations to help debugging and calibration
 if DEBUG:
     create_color_range_slider('yCrCb Color Settings', yCrCb_range)
     create_color_range_slider('HSV Color Settings', HSV_range)
@@ -739,11 +469,8 @@ if SHOW_TRACKERS or DEBUG:
         deep_convexity_defects_points = debug['deep_convexity_defects_points']
         max_incircles = debug['max_incircles']
 
-        # flooded_contours = np.zeros((height, width), np.uint8)
-
         for cnt, enclosing_circle, (cX, cY), hull, k_curvature, defects, defects_deep, incircle in zip(contours, min_enclosing_circles, centroids, convex_hulls, k_curvatures, convexity_defects, deep_convexity_defects_points, max_incircles):
             cv2.drawContours(img, [cnt], 0, (0, 255, 0), cv2.FILLED)
-            # cv2.drawContours(flooded_contours, [cnt], 0, 255, cv2.FILLED)
 
             (center, radius) = enclosing_circle
             cv2.circle(img, center, radius, (0, 0, 0), 1)
@@ -776,26 +503,14 @@ if SHOW_TRACKERS or DEBUG:
 
         if debug['face_bbox']:
             (x, y, w, h) = debug['face_bbox']
-            # cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0) if jones else (0, 0, 255), 2)
             cv2.rectangle(img, (x, y), (x + w, y + h), (255, 0, 0), 2)
 
-        # img = cv2.flip(img, flipCode=1)
         cv2.putText(img=img, text='{:.2f}'.format(debug['fps']),
                     org=(0, 20), fontFace=cv2.FONT_HERSHEY_SIMPLEX,
                     fontScale=1, color=255)
 
-        # cv2.rectangle(img, (0, 0), (320, 180), (0, 0, 255), 3)
-        # cv2.imshow('img', img[:, :, :180])
         cv2.imshow('img', img)
         cv2.waitKey(10)
 
 
 track.start()
-
-
-# ??? pause the event!!! ..but check for consumers...
-# track.pause('cats')   # what about dependencies? =False (default, stop callbacks, but continue eval if other deps)
-# track.resume('cats')
-#
-
-# add ttl? i.e. get single picture? call pause on the decorator that was saved to dict
