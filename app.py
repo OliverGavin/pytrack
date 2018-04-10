@@ -1,6 +1,7 @@
 import argparse
 import base64
 import logging
+from enum import Enum
 from functools import partial
 
 import pyautogui
@@ -10,9 +11,15 @@ from socketIO_client import SocketIO, BaseNamespace
 
 from pytrackcontrol import TrackEventController
 from pytrackcontrol.providers import FPSProvider, FaceBBoxProvider
-from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convex_hull, find_convexity_defects, find_k_curvatures, find_deep_convexity_defects_points, find_max_incircle
+from pytrackvision.vision.contours import find_contours, find_min_enclosing_circle, find_centroid, find_convex_hull, find_convexity_defects, find_k_curvatures, find_deep_convexity_defects_points, find_max_incircle, nearest_point_distance
 
 from multiprocessing import Process, Pipe
+
+
+class MouseClikedState(Enum):
+    CURRENT = 0
+    RELEASED = 1
+    PRESSED = 2
 
 
 def reader(pipe):
@@ -24,19 +31,39 @@ def reader(pipe):
 
     while True:
         try:
-            x, y = in_pipe.recv()
+            (x, y), click = in_pipe.recv()
             y = min(y, 180)
 
             x = 320 - x
-            # x = int((x / 320) * width)
+            x = int((x / 320) * width)
             # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
-            x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
+            # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
             # y = int((y / 240) * height)
             # y = int((y / 180) * height)
-            y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
+            y = int(((y / 180) * height) - 0.1 * (((180 - y) / 180) * height))
+
+            # if abs(xx - x) > 10 or abs(yy - y) > 10:  # TODO
+            #     xx, yy = x, y
+
+            # if click:
+            #     print('drag')
+            #     pyautogui.dragTo(x, y, duration=0.03, pause=0.0, button='left')
+            #     # pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
+            # else:
+            #     print('move')
+            #     pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
+
+            if click == MouseClikedState.RELEASED:
+                print('RELEASED')
+                pyautogui.mouseUp(button='left')
+            elif click == MouseClikedState.PRESSED:
+                print('PRESSED')
+                pyautogui.mouseDown(button='left')
+            elif click == MouseClikedState.CURRENT:
+                print('CURRENT')
 
             if abs(xx - x) > 10 or abs(yy - y) > 10:  # TODO
-                #pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
+                pyautogui.moveTo(x, y, duration=0.03, pause=0.0)
                 xx, yy = x, y
 
         except EOFError:
@@ -98,8 +125,6 @@ def img_provider(resolve, src):
 face_bbox_provider = FaceBBoxProvider()
 track.register('face_bbox', face_bbox_provider.provide, dep=['img'])
 
-# separate viola jones from tracker??
-
 
 @track.register('face', dep=['img', 'face_bbox'])
 def face_provider(resolve, img, face_bbox):
@@ -114,11 +139,6 @@ def face_provider(resolve, img, face_bbox):
         x, y = x-s, y-s
         face = img[clamp_y(y) : clamp_y(y+h), clamp_x(x) : clamp_x(x+w)]
         resolve(face)
-
-
-# @track.register('face_skin_color_extraction', dep=['img', 'face_bbox'])
-# def face_skin_color_extraction_provider(resolve, img, face_bbox):
-#     ...
 
 
 class Range:
@@ -179,31 +199,44 @@ def create_color_range_slider(title, color_space_range):
         cv2.createTrackbar(f'{label} max', title, color_range.max, 255, _update(color_range, 'max'))
 
 
-# # Lab black screen
-# yCrCb_range = ColorSpaceRange({
-#     'y':  (131, 255),
-#     'cr': (129, 176),
-#     'cb': (0,   255),
-# })
-#
-# HSV_range = ColorSpaceRange({
-#     'h': (106, 255),
-#     's': (12,  70),
-#     'v': (150, 247),
-# })
-
-# Lab wall
+# Lab black screen
 yCrCb_range = ColorSpaceRange({
-    'y':  (118, 255),
-    'cr': (133, 159),
-    'cb': (104, 136),
+    'y':  (131, 255),
+    'cr': (129, 176),
+    'cb': (0,   255),
 })
 
 HSV_range = ColorSpaceRange({
-    'h': (0,   22),
-    's': (34,  105),
-    'v': (141, 215),
+    'h': (106, 255),
+    's': (12,  70),
+    'v': (150, 247),
 })
+
+# # Lab wall new
+# yCrCb_range = ColorSpaceRange({
+#     'y':  (133, 195),
+#     'cr': (136, 162),
+#     'cb': (122, 137),
+# })
+#
+# HSV_range = ColorSpaceRange({
+#     'h': (0,   192),
+#     's': (28,  160),
+#     'v': (150, 223),
+# })
+
+# # Lab wall
+# yCrCb_range = ColorSpaceRange({
+#     'y':  (118, 255),
+#     'cr': (133, 159),
+#     'cb': (104, 136),
+# })
+#
+# HSV_range = ColorSpaceRange({
+#     'h': (0,   22),
+#     's': (34,  105),
+#     'v': (141, 215),
+# })
 
 # # Home
 # yCrCb_range = ColorSpaceRange({
@@ -342,50 +375,6 @@ def skin_segmentation_mask_provider(resolve, ycrcb_mask, hsv_mask, bbox):
 
     resolve(skin_mask)
 
-# def a(ximg_ycrcb, xycrcb_range):
-#     import cv2
-#     img_y, img_cr, img_cb = cv2.split(ximg_ycrcb)
-#
-#     mask_y = cv2.inRange(img_y, xycrcb_range['y'].min, xycrcb_range['y'].max)
-#     mask_cr = cv2.inRange(img_cr, xycrcb_range['cr'].min, xycrcb_range['cr'].max)
-#     mask_cb = cv2.inRange(img_cb, xycrcb_range['cb'].min, xycrcb_range['cb'].max)
-#
-#     ycrcb_mask = cv2.bitwise_and(mask_cb, mask_cr)
-#     ycrcb_mask = cv2.bitwise_and(mask_y, ycrcb_mask)
-#     return ycrcb_mask
-#
-# def b(ximg_hsv, xhsv_range):
-#     import cv2
-#     img_h, img_s, img_v = cv2.split(ximg_hsv)
-#
-#     mask_h = cv2.inRange(img_h, xhsv_range['h'].min, xhsv_range['h'].max)
-#     mask_s = cv2.inRange(img_s, xhsv_range['s'].min, xhsv_range['s'].max)
-#     mask_v = cv2.inRange(img_v, xhsv_range['v'].min, xhsv_range['v'].max)
-#
-#     hsv_mask = cv2.bitwise_and(mask_v, mask_s)
-#     hsv_mask = cv2.bitwise_and(mask_h, hsv_mask)
-#
-# @track.register('skin_segmentation_mask', dep=['img_ycrcb', 'ycrcb_range', 'img_hsv', 'hsv_range', 'face_bbox'])
-# def skin_segmentation_mask_provider(resolve, img_ycrcb, ycrcb_range, img_hsv, hsv_range, bbox):
-#
-#
-#     # futures = [self._executor.submit(execute, fn, e, inputs) for e, (fn, res, inputs) in jobs.items()]
-#     #                     for future in futures:
-#     #                         res(future.result())
-#     fa = executor.submit(a, img_ycrcb, ycrcb_range)
-#     fb = executor.submit(b, img_hsv, hsv_range)
-#
-#     ycrcb_mask = fa.result()
-#     hsv_mask = fb.result()
-#     print(ycrcb_mask)
-#     skin_mask = cv2.bitwise_or(ycrcb_mask, hsv_mask)
-#
-#     x, y, w, h = bbox
-#     iw, ih = ycrcb_mask.shape
-#     skin_mask[y - int(.2 * h): y + h + int(.4 * h), x: x + w] = 0
-#
-#     resolve(skin_mask)
-
 
 @track.register('skin_mask', dep=['skin_segmentation_mask'])
 def skin_mask_provider(resolve, skin_segmentation_mask):
@@ -400,7 +389,7 @@ def skin_mask_provider(resolve, skin_segmentation_mask):
 
 @track.register('contours', dep=['skin_mask'])
 def contours_provider(resolve, skin_mask):
-    contours = find_contours(skin_mask, min_area=800, max_area=8000)
+    contours = find_contours(skin_mask, min_area=400, max_area=8000)
     resolve(contours)
 
 
@@ -456,20 +445,11 @@ def contours_convexity_defects_provider(resolve, contours, convex_hulls):
 
 @track.register('contours_deep_convexity_defects_points', dep=['contours', 'contours_convexity_defects'])
 def contours_deep_convexity_defects_points_provider(resolve, contours, convexity_defects):
-    # import pdb; pdb.set_trace()
     deep_convexity_defects_points = []
     for cnt, defects in zip(contours, convexity_defects):
         points = find_deep_convexity_defects_points(cnt, defects)
         deep_convexity_defects_points.append(points)
     resolve(deep_convexity_defects_points)
-
-
-def nearest_point_distance(node, nodes):
-    deltas = nodes - node
-    dist = np.linalg.norm(deltas, axis=1)
-    # min_idx = np.argmin(dist)
-    # return nodes[min_idx], dist[min_idx], deltas[min_idx][1]/deltas[min_idx][0]
-    return np.min(dist)
 
 
 @track.register('contours_max_incircle', dep=['contours', 'contours_moments_centroid', 'contours_deep_convexity_defects_points'])
@@ -484,24 +464,216 @@ def contours_max_incircle_provider(resolve, contours, centroids, deep_convexity_
     resolve(incircles)
 
 
-@track.register('hands', dep=['contours_moments_centroid'])
-def hands_provider(resolve, centroids):
-    resolve(centroids)
+from enum import Enum
 
 
-@track.on('hands')
-def hands_handler(hands):
+class Gesture(Enum):
+    NONE = 'NONE'
+    HAND = 'HAND'
+    HAND_OPENED = 'HAND_OPENED'
+    HAND_CLOSED = 'HAND_CLOSED'
+
+
+@track.register('hand_gestures', dep=['contours', 'contours_max_incircle', 'contours_min_enclosing_circle', 'contours_moments_centroid', 'k_curvatures', 'contours_deep_convexity_defects_points'])
+def hand_gestures_provider(resolve, contours, max_incircles, min_enclosing_circles, centroids, k_curvatures, deep_convexity_defects_points):
+    gestures = []
+
+    for contour, max_incircle, min_enclosing_circle, centroid, k_curvature, defects in zip(contours, max_incircles, min_enclosing_circles, centroids, k_curvatures, deep_convexity_defects_points):
+
+        if not all([contour is not None, max_incircle, min_enclosing_circle, centroid, k_curvature is not None, defects is not None]):
+            continue
+
+        gesture = Gesture.NONE
+
+        Ca, ra = max_incircle
+        Cb, rb = min_enclosing_circle
+
+        if rb < 2 * ra and len(k_curvature) <= 1:
+            gesture = Gesture.HAND_CLOSED
+
+        elif rb < 3 * ra and 3 <= len(k_curvature) <= 5:
+            gesture = Gesture.HAND_OPENED
+
+        else:
+            gesture = Gesture.HAND
+
+        # gestures.append(len(k_curvature))
+        gestures.append((gesture, centroid))
+
+    resolve(gestures)
+
+
+from abc import ABC, abstractmethod
+from collections import deque
+
+
+class GestureState(ABC):
+
+    @abstractmethod
+    def run(self):
+        ...
+
+    @abstractmethod
+    def next(self, gesture):
+        ...
+
+
+class GestureStateTransition(GestureState):
+
+    def __init__(self):
+        self.transitions = None
+
+    def next(self, gesture):
+        if gesture in self.transitions:
+            return self.transitions[gesture]
+        else:
+            raise ValueError(f"Gesture transition ({gesture.name}) not supported from the current state")
+
+
+class HandPending(GestureStateTransition):
+
+    def run(self):
+        # print("Waiting for an opened hand")
+        return Gesture.NONE
+
+    def next(self, gesture):
+        if not self.transitions:
+            self.transitions = {
+                Gesture.NONE: GestureStateMachine.hand_pending,
+                Gesture.HAND_OPENED: GestureStateMachine.hand_opened
+            }
+        return GestureStateTransition.next(self, gesture)
+
+
+class HandOpened(GestureStateTransition):
+
+    def run(self):
+        # print("Opened hand")
+        return Gesture.HAND_OPENED
+
+    def next(self, gesture):
+        if not self.transitions:
+            self.transitions = {
+                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
+                Gesture.NONE: GestureStateMachine.hand_pending,
+                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
+                Gesture.HAND: GestureStateMachine.hand_unkown
+            }
+        return GestureStateTransition.next(self, gesture)
+
+
+class HandClosed(GestureStateTransition):
+
+    def run(self):
+        # print("Closed hand")
+        return Gesture.HAND_CLOSED
+
+    def next(self, gesture):
+        if not self.transitions:
+            self.transitions = {
+                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
+                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
+                Gesture.NONE: GestureStateMachine.hand_pending,
+                Gesture.HAND: GestureStateMachine.hand_unkown
+            }
+        return GestureStateTransition.next(self, gesture)
+
+
+class HandUnkown(GestureStateTransition):
+
+    def run(self):
+        # print("Unknown hand")
+        return Gesture.HAND
+
+    def next(self, gesture):
+        if not self.transitions:
+            self.transitions = {
+                Gesture.HAND: GestureStateMachine.hand_unkown,
+                Gesture.HAND_CLOSED: GestureStateMachine.hand_closed,
+                Gesture.HAND_OPENED: GestureStateMachine.hand_opened,
+                Gesture.NONE: GestureStateMachine.hand_pending
+            }
+        return GestureStateTransition.next(self, gesture)
+
+
+class GestureStateMachine:
+
+    hand_pending = HandPending()
+    hand_opened = HandOpened()
+    hand_closed = HandClosed()
+    hand_unkown = HandUnkown()
+
+    def __init__(self, initialState=None):
+        self.current_state = initialState if initialState else GestureStateMachine.hand_pending
+        self.current_state.run()
+        self.incomming_gestures = deque(maxlen=3)
+
+    def run(self, gesture):
+        # print('input: ', gesture)
+        try:
+            new_state = self.current_state.next(gesture)
+        except ValueError:
+            new_state = self.current_state
+
+        self.incomming_gestures.append(new_state.run())
+        if all([g == gesture for g in self.incomming_gestures]):
+            self.current_state = new_state
+
+        return self.current_state.run()
+
+
+gesture_state_machine = GestureStateMachine()
+pointer_pos = None
+pointer_clicked = False
+
+
+@track.register('hand', dep=['hand_gestures'])
+def hand_provider(resolve, hand_gestures):
+    distance = None
+    centroid = None
+    gesture = None
+
+    for g, c in hand_gestures:
+        if distance is None or nearest_point_distance(pointer_pos, np.array(c)) < distance:
+            gesture = g
+            centroid = c
+
+    if centroid and gesture:
+        gesture = gesture_state_machine.run(gesture)
+        resolve((centroid, gesture))
+
+
+@track.on('hand')
+def hand_handler(hand):
+    global pointer_clicked
     # width, height = pyautogui.size()
-    for (x, y) in hands:
-        # x = 320 - x
-        # # x = int((x / 320) * width)
-        # # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
-        # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
-        # # y = int((y / 240) * height)
-        # # y = int((y / 180) * height)
-        # y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
-        # pyautogui.moveTo(x, y, duration=0.0)
-        writer((x, y), in_pipe)
+    (x, y), gesture = hand
+    print(gesture.name, (x, y))
+
+    if (gesture == Gesture.HAND_OPENED or gesture == Gesture.NONE):
+        click = MouseClikedState.RELEASED  # release
+        # pointer_clicked = False
+    elif gesture == Gesture.HAND_CLOSED:
+        click = MouseClikedState.PRESSED  # press
+        # pointer_clicked = True
+    else:
+        click = MouseClikedState.CURRENT  # remain
+
+    pointer_clicked = click
+
+
+    # x = 320 - x
+    # # x = int((x / 320) * width)
+    # # x = int(((x / 320) * width) - 0.25 * ((x / 320) * (width/2)))
+    # x = int(((x / 320) * width) + 0.1 * ((x / 320) * (width/2)))
+    # # y = int((y / 240) * height)
+    # # y = int((y / 180) * height)
+    # y = int(((y / 180) * height) + 0.1 * ((y / 180) * height))
+    # pyautogui.moveTo(x, y, duration=0.0)
+    writer(((x, y), pointer_clicked), in_pipe)
+
+
+# merge centroids and gestures for state machine
 
 
 @track.on('face')
